@@ -1,0 +1,90 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.kapp.shell'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.kapp.shell"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    
+    // Define the location of the compiled native library
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
+}
+
+// Task to build Rust library
+tasks.register('cargoBuild', Exec) {
+    // Determine the target architecture. For simplicity, we create a fat APK or split per ABI.
+    // Here we assume a single target for demonstration or iterate all.
+    // You would typically use cargo-ndk here.
+    environment 'PATH', "${System.env.PATH}:${System.env.HOME}/.cargo/bin"
+    // Prefer ANDROID_NDK_HOME, otherwise auto-detect from common SDK locations.
+    def ndkHome = System.env.ANDROID_NDK_HOME
+    if (!ndkHome) {
+        def ndkCandidates = [
+            System.env.ANDROID_SDK_ROOT ? new File(System.env.ANDROID_SDK_ROOT, 'ndk') : null,
+            System.env.ANDROID_HOME ? new File(System.env.ANDROID_HOME, 'ndk') : null,
+            new File("${System.env.HOME}/Library/Android/sdk/ndk"),
+            new File("${System.env.HOME}/Library/Android/sdk/ndk-bundle")
+        ].findAll { it != null && it.exists() }
+
+        for (def candidate : ndkCandidates) {
+            if (candidate.name == 'ndk-bundle' && new File(candidate, 'toolchains').exists()) {
+                ndkHome = candidate.absolutePath
+                break
+            }
+
+            if (candidate.name == 'ndk') {
+                def versions = candidate.listFiles()?.findAll { it.isDirectory() }?.sort { a, b -> a.name <=> b.name }
+                if (versions && !versions.isEmpty()) {
+                    ndkHome = versions.last().absolutePath
+                    break
+                }
+            }
+        }
+    }
+
+    if (!ndkHome || !file(ndkHome).exists()) {
+        throw new GradleException('Android NDK not found. Set ANDROID_NDK_HOME or install NDK via Android Studio SDK Manager.')
+    }
+
+    environment 'ANDROID_NDK_HOME', ndkHome
+    // Keep x86_64 for emulator/CI startup smoke tests.
+    commandLine 'cargo', 'ndk', '-t', 'arm64-v8a', '-t', 'armeabi-v7a', '-o', '../jniLibs', 'build', '--release'
+    workingDir 'src/main/rust'
+    
+    // Keep Android build honest: Rust/NDK failure should fail the build.
+    ignoreExitValue = false
+}
+
+// Hook cargo build into the build process
+preBuild.dependsOn cargoBuild

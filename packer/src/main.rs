@@ -1,0 +1,645 @@
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use clap::Parser;
+use rand::Rng;
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
+
+mod config;
+use config::get_aes_key;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long)]
+    target: PathBuf,
+
+    #[arg(short, long)]
+    output: PathBuf,
+
+    #[arg(long)]
+    bootstrap_apk: PathBuf,
+
+    #[arg(long)]
+    bootstrap_lib_dir: PathBuf,
+
+    #[arg(long)]
+    patched_manifest: Option<PathBuf>,
+
+    #[arg(long = "keep-class")]
+    keep_class: Vec<String>,
+
+    #[arg(long = "keep-prefix")]
+    keep_prefix: Vec<String>,
+
+    #[arg(long = "keep-lib")]
+    keep_lib: Vec<String>,
+
+    #[arg(long = "encrypt-asset")]
+    encrypt_asset: Vec<String>,
+
+    #[arg(long)]
+    resources: Option<PathBuf>,
+
+    #[arg(long)]
+    payload_out: Option<PathBuf>,
+
+    #[arg(long)]
+    payload_in: Option<PathBuf>,
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    println!(
+        "Packing target {} -> {}",
+        args.target.display(),
+        args.output.display()
+    );
+
+    let keep_descriptors: Vec<String> = args
+        .keep_class
+        .iter()
+        .map(|class_name| to_dex_descriptor(class_name))
+        .collect();
+
+    let keep_prefixes: Vec<String> = args
+        .keep_prefix
+        .iter()
+        .map(|prefix| {
+            let trimmed = prefix.trim().trim_matches('.');
+            format!("L{}/", trimmed.replace('.', "/"))
+        })
+        .collect();
+
+    let keep_libs: Vec<String> = args.keep_lib.clone();
+
+    println!("Keep descriptors: {:?}", keep_descriptors);
+    println!("Keep prefixes: {:?}", keep_prefixes);
+    println!("Keep libs: {:?}", keep_libs);
+
+    let payload_blob = if let Some(path) = &args.payload_in {
+        println!("Using pre-generated payload from {}", path.display());
+        let mut f = File::open(path)?;
+        let mut b = Vec::new();
+        f.read_to_end(&mut b)?;
+        b
+    } else {
+        let entries = collect_and_encrypt_payload_entries(
+            &args.target, 
+            &keep_descriptors, 
+            &keep_prefixes, 
+            &keep_libs,
+            &args.encrypt_asset
+        )?;
+        if entries.is_empty() {
+            anyhow::bail!("No classes*.dex or lib/**/*.so found in target APK");
+        }
+        build_payload_blob(&entries)
+    };
+
+    if let Some(path) = &args.payload_out {
+        println!("Saving payload blob to {}", path.display());
+        let mut f = File::create(path)?;
+        f.write_all(&payload_blob)?;
+        return Ok(());
+    }
+
+    let encrypted_entry_names = get_encrypted_names_from_blob(&payload_blob);
+
+    repack_target_with_bootstrap(
+        &args.target,
+        &args.bootstrap_apk,
+        &args.bootstrap_lib_dir,
+        args.patched_manifest.as_deref(),
+        args.resources.as_deref(),
+        &encrypted_entry_names,
+        &args.output,
+        &payload_blob,
+    )?;
+
+    println!("Success! Output written to {}", args.output.display());
+    Ok(())
+}
+
+fn is_payload_entry(name: &str) -> bool {
+    let is_dex = name.starts_with("classes") && name.ends_with(".dex");
+    let is_lib = name.starts_with("lib/") && name.ends_with(".so");
+    let is_asset = name.starts_with("assets/");
+    is_dex || is_lib || is_asset
+}
+
+fn to_dex_descriptor(class_name: &str) -> String {
+    let trimmed = class_name.trim();
+    if trimmed.starts_with('L') && trimmed.ends_with(';') {
+        return trimmed.to_string();
+    }
+    format!("L{};", trimmed.replace('.', "/"))
+}
+
+fn class_index(name: &str) -> Option<usize> {
+    if name == "classes.dex" {
+        return Some(1);
+    }
+    if name.starts_with("classes") && name.ends_with(".dex") {
+        let middle = &name[7..name.len() - 4];
+        if middle.is_empty() {
+            return Some(1);
+        }
+        return middle.parse::<usize>().ok();
+    }
+    None
+}
+
+fn dex_name_for_index(index: usize) -> String {
+    if index == 1 {
+        "classes.dex".to_string()
+    } else {
+        format!("classes{}.dex", index)
+    }
+}
+
+fn should_keep_dex(_name: &str, dex_bytes: &[u8], keep_descriptors: &[String]) -> bool {
+    for descriptor in keep_descriptors {
+        if dex_bytes.windows(descriptor.len()).any(|window| window == descriptor.as_bytes()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn matches_keep_prefix(dex_bytes: &[u8], keep_prefixes: &[String]) -> bool {
+    for prefix in keep_prefixes {
+        if dex_bytes.windows(prefix.len()).any(|window| window == prefix.as_bytes()) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn should_keep_lib(name: &str, keep_libs: &[String]) -> bool {
+    let filename = Path::new(name).file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    
+    for kept in keep_libs {
+        if filename == kept || filename == format!("lib{}.so", kept) || filename == format!("{}.so", kept) {
+            return true;
+        }
+    }
+    false
+}
+
+fn should_encrypt_asset(name: &str, encrypt_asset_patterns: &[String]) -> bool {
+    if !name.starts_with("assets/") {
+        return false;
+    }
+    // Don't encrypt our own shell payload or manifest
+    if name == "assets/kapp_payload.bin" {
+        return false;
+    }
+    
+    for pattern in encrypt_asset_patterns {
+        if pattern == "*" || pattern == "assets/*" {
+             return true;
+        }
+        if pattern.starts_with('*') {
+            if name.ends_with(&pattern[1..]) {
+                return true;
+            }
+        } else if pattern.ends_with('*') {
+            if name.starts_with(&pattern[0..pattern.len()-1]) {
+                return true;
+            }
+        } else if name == pattern || format!("assets/{}", pattern) == name {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_and_encrypt_payload_entries(
+    target_apk: &Path,
+    keep_descriptors: &[String],
+    keep_prefixes: &[String],
+    keep_libs: &[String],
+    encrypt_asset_patterns: &[String],
+) -> anyhow::Result<Vec<(String, Vec<u8>, [u8; 12])>> {
+    let target_file = File::open(target_apk)?;
+    let mut zip = ZipArchive::new(target_file)?;
+
+    let mut entries: Vec<(String, Vec<u8>, [u8; 12])> = Vec::new();
+
+    for i in 0..zip.len() {
+        let file = zip.by_index(i)?;
+        let name = file.name().to_string();
+
+        if is_payload_entry(&name) {
+            drop(file);
+            let mut file = zip.by_index(i)?;
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)?;
+
+            if name.ends_with(".dex")
+                && (should_keep_dex(&name, &buffer, keep_descriptors)
+                    || matches_keep_prefix(&buffer, keep_prefixes))
+            {
+                println!("Keeping {} in plaintext for startup compatibility", name);
+                continue;
+            }
+
+            if name.ends_with(".so") && should_keep_lib(&name, keep_libs) {
+                println!("Keeping {} in plaintext for startup compatibility", name);
+                continue;
+            }
+
+            if name.starts_with("assets/") {
+                if !should_encrypt_asset(&name, encrypt_asset_patterns) {
+                    // It's an asset but not marked for encryption
+                    continue;
+                }
+            }
+
+            println!("Encrypting {}...", name);
+            let (encrypted, nonce) = encrypt_payload(&buffer)?;
+            entries.push((name, encrypted, nonce));
+        }
+    }
+
+    println!("Encrypted {} entries total", entries.len());
+    Ok(entries)
+}
+
+fn build_payload_blob(entries: &[(String, Vec<u8>, [u8; 12])]) -> Vec<u8> {
+    let mut payload_blob = Vec::new();
+
+    for (_, enc_data, _) in entries {
+        payload_blob.extend_from_slice(enc_data);
+    }
+
+    let mut metadata = Vec::new();
+    metadata.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+
+    for (name, enc_data, nonce) in entries {
+        let name_bytes = name.as_bytes();
+        metadata.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        metadata.extend_from_slice(name_bytes);
+        metadata.extend_from_slice(&(enc_data.len() as u32).to_le_bytes());
+        metadata.extend_from_slice(nonce);
+    }
+
+    payload_blob.extend_from_slice(&metadata);
+    payload_blob.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+    payload_blob.extend_from_slice(b"SHELL");
+
+    payload_blob
+}
+
+fn get_encrypted_names_from_blob(blob: &[u8]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if blob.len() < 9 || !blob.ends_with(b"SHELL") {
+        return names;
+    }
+
+    let metadata_len = u32::from_le_bytes(blob[blob.len()-9..blob.len()-5].try_into().unwrap()) as usize;
+    if blob.len() < 9 + metadata_len {
+        return names;
+    }
+
+    let metadata = &blob[blob.len()-9-metadata_len..blob.len()-9];
+    let mut pos = 0;
+    
+    if metadata.len() < 4 { return names; }
+    let count = u32::from_le_bytes(metadata[0..4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    for _ in 0..count {
+        if pos + 2 > metadata.len() { break; }
+        let name_len = u16::from_le_bytes(metadata[pos..pos+2].try_into().unwrap()) as usize;
+        pos += 2;
+        if pos + name_len > metadata.len() { break; }
+        let name = String::from_utf8_lossy(&metadata[pos..pos+name_len]).to_string();
+        names.insert(name);
+        pos += name_len;
+        
+        if pos + 4 + 12 > metadata.len() { break; }
+        pos += 4 + 12; // skip data_len and nonce
+    }
+
+    names
+}
+
+fn repack_target_with_bootstrap(
+    target_apk: &Path,
+    bootstrap_apk: &Path,
+    bootstrap_lib_dir: &Path,
+    patched_manifest: Option<&Path>,
+    resources_arsc: Option<&Path>,
+    encrypted_entry_names: &HashSet<String>,
+    output_apk: &Path,
+    payload_blob: &[u8],
+) -> anyhow::Result<()> {
+    let target_file = File::open(target_apk)?;
+    let mut target_zip = ZipArchive::new(target_file)?;
+
+    let output_file = File::create(output_apk)?;
+    let mut writer = ZipWriter::new(output_file);
+
+    let patched_manifest_bytes = if let Some(path) = patched_manifest {
+        let mut bytes = Vec::new();
+        File::open(path)?.read_to_end(&mut bytes)?;
+        Some(bytes)
+    } else {
+        None
+    };
+
+    let resources_arsc_bytes = if let Some(path) = resources_arsc {
+        let mut bytes = Vec::new();
+        File::open(path)?.read_to_end(&mut bytes)?;
+        Some(bytes)
+    } else {
+        None
+    };
+
+    let mut retained_dex_entries: Vec<(usize, Vec<u8>)> = Vec::new();
+
+    for i in 0..target_zip.len() {
+        let mut file = target_zip.by_index(i)?;
+        let name = file.name().to_string();
+
+        if name == "assets/kapp_payload.bin" || encrypted_entry_names.contains(&name) {
+            continue;
+        }
+
+        if name == "AndroidManifest.xml" {
+            if let Some(bytes) = &patched_manifest_bytes {
+                let options = FileOptions::default().compression_method(file.compression());
+                writer.start_file(name, options)?;
+                writer.write_all(bytes)?;
+                continue;
+            }
+        }
+
+        if name == "resources.arsc" {
+            if let Some(bytes) = &resources_arsc_bytes {
+                let options = FileOptions::default().compression_method(file.compression());
+                writer.start_file(name, options)?;
+                writer.write_all(bytes)?;
+                continue;
+            }
+        }
+
+        let options = FileOptions::default().compression_method(file.compression());
+        if file.is_dir() {
+            writer.add_directory(name, options)?;
+        } else {
+            if let Some(index) = class_index(&name) {
+                let mut dex_bytes = Vec::new();
+                file.read_to_end(&mut dex_bytes)?;
+                retained_dex_entries.push((index, dex_bytes));
+                continue;
+            }
+            writer.start_file(name, options)?;
+            std::io::copy(&mut file, &mut writer)?;
+        }
+    }
+
+    retained_dex_entries.sort_by_key(|(index, _)| *index);
+
+    // 1. Inject Bootstrap DEX as the FIRST dex file(s)
+    let bootstrap_dex_entries = get_bootstrap_dex_entries(bootstrap_apk)?;
+    let num_bootstrap_dexes = bootstrap_dex_entries.len();
+    
+    let dex_options = FileOptions::default().compression_method(CompressionMethod::Stored);
+    for (i, dex_bytes) in bootstrap_dex_entries.into_iter().enumerate() {
+        let dex_name = dex_name_for_index(i + 1);
+        writer.start_file(dex_name, dex_options)?;
+        writer.write_all(&dex_bytes)?;
+    }
+
+    // 2. Write Retained DEXs starting from the next index
+    for (i, (_, dex_bytes)) in retained_dex_entries.iter().enumerate() {
+        let dex_name = dex_name_for_index(num_bootstrap_dexes + i + 1);
+        writer.start_file(dex_name, dex_options)?;
+        writer.write_all(dex_bytes)?;
+    }
+
+    inject_bootstrap_libs(bootstrap_lib_dir, &mut writer)?;
+
+    writer.start_file(
+        "assets/kapp_payload.bin",
+        FileOptions::default().compression_method(CompressionMethod::Stored),
+    )?;
+    writer.write_all(payload_blob)?;
+
+    writer.finish()?;
+    Ok(())
+}
+
+fn get_bootstrap_dex_entries(bootstrap_apk: &Path) -> anyhow::Result<Vec<Vec<u8>>> {
+    let bootstrap_file = File::open(bootstrap_apk)?;
+    let mut bootstrap_zip = ZipArchive::new(bootstrap_file)?;
+
+    let mut dex_entries: Vec<(usize, Vec<u8>)> = Vec::new();
+    for i in 0..bootstrap_zip.len() {
+        let file = bootstrap_zip.by_index(i)?;
+        let name = file.name().to_string();
+        if let Some(index) = class_index(&name) {
+            drop(file);
+            let mut file = bootstrap_zip.by_index(i)?;
+            let mut dex_bytes = Vec::new();
+            file.read_to_end(&mut dex_bytes)?;
+            dex_entries.push((index, dex_bytes));
+        }
+    }
+
+    dex_entries.sort_by_key(|(index, _)| *index);
+
+    if dex_entries.is_empty() {
+        anyhow::bail!("No classes*.dex found in bootstrap APK");
+    }
+
+    Ok(dex_entries.into_iter().map(|(_, bytes)| bytes).collect())
+}
+
+fn inject_bootstrap_libs(bootstrap_lib_dir: &Path, writer: &mut ZipWriter<File>) -> anyhow::Result<()> {
+    let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+
+    let abi_dirs = std::fs::read_dir(bootstrap_lib_dir)?;
+    let mut injected_count = 0usize;
+
+    for abi_entry in abi_dirs {
+        let abi_entry = abi_entry?;
+        let abi_path = abi_entry.path();
+        if !abi_path.is_dir() {
+            continue;
+        }
+
+        let abi_name = abi_entry.file_name().to_string_lossy().to_string();
+        let libshell_path = abi_path.join("libshell.so");
+        if !libshell_path.exists() {
+            continue;
+        }
+
+        let mut file = File::open(&libshell_path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+
+        let zip_path = format!("lib/{}/libshell.so", abi_name);
+        writer.start_file(zip_path, options)?;
+        writer.write_all(&bytes)?;
+        injected_count += 1;
+    }
+
+    if injected_count == 0 {
+        anyhow::bail!(
+            "No libshell.so found under bootstrap_lib_dir: {}",
+            bootstrap_lib_dir.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn encrypt_payload(data: &[u8]) -> anyhow::Result<(Vec<u8>, [u8; 12])> {
+    let key = get_aes_key();
+    let cipher = Aes256Gcm::new(&key.into());
+
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, data)
+        .map_err(|e| anyhow::anyhow!("Encryption failure: {:?}", e))?;
+
+    Ok((ciphertext, nonce_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn create(prefix: &str) -> Self {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("packer-{prefix}-{ts}"));
+            std::fs::create_dir_all(&path).expect("failed to create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) -> anyhow::Result<()> {
+        let file = File::create(path)?;
+        let mut writer = ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, data) in entries {
+            writer.start_file(*name, options)?;
+            writer.write_all(data)?;
+        }
+        writer.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn repack_target_encrypts_mmkv_and_excludes_plaintext_payload_entries() -> anyhow::Result<()> {
+        let temp = TestDir::create("artifact-audit");
+        let target_apk = temp.path.join("target.apk");
+        let bootstrap_apk = temp.path.join("bootstrap.apk");
+        let output_apk = temp.path.join("output.apk");
+        let bootstrap_lib_dir = temp.path.join("bootstrap-libs");
+        let arm64_dir = bootstrap_lib_dir.join("arm64-v8a");
+
+        std::fs::create_dir_all(&arm64_dir)?;
+        std::fs::write(arm64_dir.join("libshell.so"), b"shell-lib")?;
+
+        write_zip(
+            &target_apk,
+            &[
+                ("classes.dex", b"original-main-dex"),
+                ("classes2.dex", b"original-second-dex"),
+                ("lib/arm64-v8a/libmmkv.so", b"original-mmkv-lib"),
+                ("assets/secret.txt", b"original-secret-asset"),
+                ("res/raw/public.txt", b"public-resource"),
+            ],
+        )?;
+
+        write_zip(&bootstrap_apk, &[("classes.dex", b"bootstrap-dex")])?;
+
+        let empty: Vec<String> = Vec::new();
+        let encrypt_assets = vec!["assets/*".to_string()];
+
+        let entries = collect_and_encrypt_payload_entries(
+            &target_apk,
+            &empty,
+            &empty,
+            &empty,
+            &encrypt_assets,
+        )?;
+        let payload_blob = build_payload_blob(&entries);
+        let encrypted_entry_names = get_encrypted_names_from_blob(&payload_blob);
+
+        assert!(encrypted_entry_names.contains("classes.dex"));
+        assert!(encrypted_entry_names.contains("classes2.dex"));
+        assert!(encrypted_entry_names.contains("lib/arm64-v8a/libmmkv.so"));
+        assert!(encrypted_entry_names.contains("assets/secret.txt"));
+
+        repack_target_with_bootstrap(
+            &target_apk,
+            &bootstrap_apk,
+            &bootstrap_lib_dir,
+            None,
+            None,
+            &encrypted_entry_names,
+            &output_apk,
+            &payload_blob,
+        )?;
+
+        let mut out = ZipArchive::new(File::open(&output_apk)?)?;
+
+        // Encrypted payload blob must exist.
+        assert!(out.by_name("assets/kapp_payload.bin").is_ok());
+
+        // DEX is replaced by bootstrap DEX, not original target DEX bytes.
+        let mut dex = Vec::new();
+        out.by_name("classes.dex")?.read_to_end(&mut dex)?;
+        assert_eq!(dex, b"bootstrap-dex");
+        assert!(out.by_name("classes2.dex").is_err());
+
+        // Original plaintext payload files are removed from output.
+        assert!(out.by_name("lib/arm64-v8a/libmmkv.so").is_err());
+        assert!(out.by_name("assets/secret.txt").is_err());
+
+        // Shell runtime lib is injected and non-payload resources are kept.
+        let mut shell_lib = Vec::new();
+        out.by_name("lib/arm64-v8a/libshell.so")?
+            .read_to_end(&mut shell_lib)?;
+        assert_eq!(shell_lib, b"shell-lib");
+
+        let mut public = Vec::new();
+        out.by_name("res/raw/public.txt")?.read_to_end(&mut public)?;
+        assert_eq!(public, b"public-resource");
+
+        Ok(())
+    }
+}
