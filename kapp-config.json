@@ -1,0 +1,9 @@
+{
+    "target": "E:/a.apk",
+    "output": "protected.apk",
+    "keystore": "签名文件路径",
+    "ks_pass": "换成你的keystore密码",
+    "key_alias": "换成你的key alias",
+
+    "skip_build": false
+}
