@@ -1,5 +1,6 @@
 本项目来自于项目：https://github.com/kexuejin/crabshell 由于原项目存在bug不能正常使用，且作者貌似没有在管了，所以我修改后重新上传。
 
+我只试过并修改了用命令行的使用方式，使用gui的没有修改不确定能正常用。
 
 
 # CrabShell 🦀 (Android Hardening Toolkit)
